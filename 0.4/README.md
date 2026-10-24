@@ -85,7 +85,7 @@ plugins/my-plugin/            skills/my-skill/
   （未启用 / 依赖缺失 / 加载失败 / 模型不支持），不是笼统的"工具关闭"。
 - **两种清单文件功能等价**：`plugin.json` 与 `skill.json` 走同一条规范化流程，
   目录只决定语义分类，不限制能用哪些特性。
-- 目录出厂为空：`skills/` 与 `plugins/` 是用户后装扩展的落点，插上就能用、删掉就消失；
+- 扩展落点：`skills/` 与 `plugins/` 放扩展，插上就能用、删掉就消失（本仓库自带一个 `plugins/zerobot-runner`，用于把 ZeroBot-Plugin 脚本机器人挂到同一账号/协议端，详见插件目录）；
   思考模式等核心能力已内置进 `src/`，不依赖任何扩展。
 - **热重载默认开启**：目录放进去就生效，无需重启（`config.extensions.hotReload` 可关；
   等价于"任意落地的 JS 会被执行"，共享机器建议关掉）。

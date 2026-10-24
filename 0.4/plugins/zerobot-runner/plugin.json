@@ -1,0 +1,78 @@
+{
+  "id": "zerobot-runner",
+  "name": "ZeroBot 脚本机器人挂载",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "category": "utility",
+  "author": "QQ-agent merge",
+  "description": "把 ZeroBot-Plugin 脚本机器人（塔罗/运势/签到/表情包等 / 指令）挂到本账号：随 QQ Agent 拉起并看护它的进程与 meme-generator 表情服务，共用同一个 OneBot 协议端；AI 聊天统一由 QQ Agent 负责，并拦截模型抢发脚本指令。",
+  "enabledByDefault": false,
+  "settings": {
+    "autoStart": true,
+    "zbpDir": "",
+    "zbpExe": "",
+    "killExisting": true,
+    "memeEnabled": true,
+    "memeDir": "",
+    "commandPrefixes": "/",
+    "guardModelSends": true,
+    "restartBudget": 5
+  },
+  "configSchema": {
+    "autoStart": {
+      "type": "boolean",
+      "label": "随本插件启动脚本机器人",
+      "description": "开启后，插件激活时自动拉起 ZeroBot-Plugin，并在进程退出后自动看护重启。"
+    },
+    "zbpDir": {
+      "type": "string",
+      "label": "ZeroBot-Plugin 目录",
+      "description": "ZeroBot-Plugin 所在目录（含 config.json 与 data/）。留空则不拉起。"
+    },
+    "zbpExe": {
+      "type": "string",
+      "label": "ZeroBot-Plugin 可执行文件",
+      "description": "exe 完整路径；留空时自动取「目录/ZeroBot-Plugin.exe」。"
+    },
+    "killExisting": {
+      "type": "boolean",
+      "label": "激活时清理同名残留进程",
+      "description": "拉起前结束已存在的 ZeroBot-Plugin 进程，防止手动启动或上次残留的实例重复回复（两个实例连同一协议端会双倍回复）。"
+    },
+    "memeEnabled": {
+      "type": "boolean",
+      "label": "一并拉起 meme-generator 表情服务",
+      "description": "启动脚本机器人的同时启动本地表情服务（端口 2233）。若端口已有服务在监听则直接复用，不重复启动。"
+    },
+    "memeDir": {
+      "type": "string",
+      "label": "meme-generator 目录",
+      "description": "含 .venv 虚拟环境的 meme-generator 目录（表情 petpet / meme 指令依赖它）。留空则不拉起。"
+    },
+    "commandPrefixes": {
+      "type": "string",
+      "label": "脚本指令前缀",
+      "description": "逗号分隔，如 / 或 /,表情,meme。以这些前缀开头的消息视为脚本机器人指令；模型自己发送它们会被拦截，避免双执行。留空关闭拦截。"
+    },
+    "guardModelSends": {
+      "type": "boolean",
+      "label": "拦截模型抢发脚本指令",
+      "description": "模型用 send_message / send_to 发送「以指令前缀开头」的消息时直接拒绝并提示它改口。"
+    },
+    "restartBudget": {
+      "type": "number",
+      "label": "崩溃自动重启上限",
+      "description": "10 分钟窗口内最多自动重启次数，超过后停止看护并记录日志（0 = 不自动重启）。"
+    }
+  },
+  "prompt": {
+    "sections": [
+      {
+        "id": "zerobot-coworker",
+        "title": "同账号的脚本机器人",
+        "priority": 60,
+        "content": "## 同账号还挂着一个脚本机器人\n\n这个 QQ 账号上，除了你，还有一个 ZeroBot 脚本机器人在同时工作（同一协议端、同一账号，同时在线是正常状态）：\n- 群里以 / 开头的指令（如 /塔罗、/运势、/签到、/服务列表，以及「表情 petpet」等）由它按固定脚本执行，通常立刻回复。这些不归你管，也不要复述或扮演它的执行结果。\n- 用户想要这些功能时，让他直接发对应指令即可（/服务列表 可查全部）。\n- 自然对话、查资料、看图、玩梗、记忆，都归你。"
+      }
+    ]
+  }
+}
