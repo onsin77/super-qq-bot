@@ -114,6 +114,21 @@ console.log('\n=== 二、spawnLogged：OS 级重定向（GUI 主进程管道捕�
   assert.ok(text.includes(marker), '子进程 stdout 必须出现在日志文件里（重定向路径，不依赖 data 事件）');
   assert.equal(code, 7, '退出码必须透传（cmd /c 语义），看护重启逻辑依赖它');
   ok('wrapper：输出落盘 + 退出码透传');
+
+  // extraEnv 注入：代理/AI 环境变量走同一条路径，必须验证真的传进了子进程
+  const envLog = path.join(process.env.QQ_AGENT_DATA_DIR, 'env-test.log');
+  const envMarker = 'ZBPENV-' + Date.now();
+  const envChild = mod.__test.spawnLogged(
+    process.execPath,
+    ['-e', "console.log('ENV=' + (process.env.ZBP_TEST_ENV || 'MISSING'))"],
+    os.tmpdir(),
+    envLog,
+    { ZBP_TEST_ENV: envMarker }
+  );
+  await new Promise((res) => envChild.on('exit', () => res()));
+  await new Promise((res) => setTimeout(res, 400));
+  assert.ok(fs.readFileSync(envLog, 'utf8').includes('ENV=' + envMarker), 'extraEnv 必须传进子进程环境（代理/AI 注入依赖它）');
+  ok('wrapper：环境变量注入生效（代理/AI 同路径）');
 }
 
 // ── 三、生命周期：未配置时必须是纯空转 ────────────────────────────────

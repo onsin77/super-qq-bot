@@ -193,12 +193,56 @@ function spawnLogged(exe, args, cwd, logFile, extraEnv = {}) {
   });
 }
 
-function spawnZbp(target) {
+/**
+ * 解析代理设置并探测端口；不通则返回 null（回退直连——Clash 没开时
+ * 代理变量只会坏事，直连至少保住 GitHub 源可达）。
+ * 作用域仅 zbp 子进程：它要下载的签到背景（pic.re）与老婆/猪猪图库
+ * （gitea.seku.su）在不通代理的情况下直连均被墙/卡死。
+ * NO_PROXY 固定包含回环地址，OneBot 的 ws://127.0.0.1:3001 绝不走代理。
+ */
+async function resolveProxyEnv() {
+  const raw = String(cfg().proxyUrl || '').trim();
+  if (!raw) return null;
+  try {
+    const u = new URL(raw);
+    const host = u.hostname || '127.0.0.1';
+    const port = Number(u.port) || (u.protocol === 'https:' ? 443 : 80);
+    if (!(await probePort(port, host, 1200))) {
+      warn(`代理 ${raw} 探测不通（代理软件没开？），本次直连`);
+      return null;
+    }
+    return {
+      HTTP_PROXY: raw, HTTPS_PROXY: raw,
+      http_proxy: raw, https_proxy: raw,
+      NO_PROXY: '127.0.0.1,localhost', no_proxy: '127.0.0.1,localhost'
+    };
+  } catch (e) {
+    warn(`代理地址无效：${raw}（${e.message}）`);
+    return null;
+  }
+}
+
+/** 塔罗 AI 解析的接口配置（OpenAI 兼容端点），注入为 ZBP_AI_* 环境变量。 */
+function aiEnvOf(c) {
+  const api = String(c.aiApiUrl || '').trim();
+  const key = String(c.aiApiKey || '').trim();
+  if (!api || !key) return null;
+  const env = { ZBP_AI_API: api, ZBP_AI_KEY: key };
+  if (c.aiModel) env.ZBP_AI_MODEL = String(c.aiModel);
+  const n = Number(c.aiMaxTokens);
+  if (Number.isFinite(n) && n > 0) env.ZBP_AI_MAXN = String(Math.floor(n));
+  return env;
+}
+
+async function spawnZbp(target) {
+  const proxyEnv = await resolveProxyEnv();
+  const aiEnv = aiEnvOf(cfg());
   const child = spawnLogged(
     target.exe,
     ['-c', path.join(target.dir, 'config.json')],
     target.dir,
-    path.join(DATA_DIR, 'zerobot-runner-zbp.log')
+    path.join(DATA_DIR, 'zerobot-runner-zbp.log'),
+    { ...proxyEnv, ...aiEnv }
   );
   const entry = { child, exe: target.exe, dir: target.dir, startedAt: Date.now() };
   child.on('error', (e) => warn(`ZeroBot-Plugin 拉起失败：${e.message}`));
@@ -211,7 +255,9 @@ function spawnZbp(target) {
   });
   S.zbp = entry;
   S.gaveUp = false;
-  log(`ZeroBot-Plugin 已拉起：${target.exe}（pid=${child.pid}），输出记录到 data/zerobot-runner-zbp.log`);
+  log(`ZeroBot-Plugin 已拉起：${target.exe}（pid=${child.pid}），输出记录到 data/zerobot-runner-zbp.log`
+    + `${proxyEnv ? `，代理 ${cfg().proxyUrl}` : '，直连'}`
+    + `${aiEnv ? '，AI 解析已配置' : ''}`);
   return entry;
 }
 
@@ -313,10 +359,10 @@ async function reconcile(reason) {
     if (S.zbp) stopZbp(reason);
   } else if (sigChanged && zbpRunning) {
     stopZbp('config-change');
-    spawnZbp(zbpTarget);
+    await spawnZbp(zbpTarget);
   } else if (!zbpRunning) {
     if (sigChanged || reason === 'activate' || budgetAllows()) {
-      spawnZbp(zbpTarget);
+      await spawnZbp(zbpTarget);
     }
   }
 
@@ -444,7 +490,7 @@ export function setup(api) {
       return { content: lines.join('\n') };
     }
   });
-  log('ZeroBot 脚本机器人挂载插件已加载 v1.1（进程看护 + 状态查询工具）');
+  log('ZeroBot 脚本机器人挂载插件已加载 v1.2（进程看护 + 状态查询 + 代理/AI 注入）');
 }
 
 /**

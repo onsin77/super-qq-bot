@@ -1,11 +1,11 @@
 {
   "id": "zerobot-runner",
   "name": "ZeroBot 脚本机器人挂载",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "apiVersion": 1,
   "category": "utility",
   "author": "QQ-agent merge",
-  "description": "把 ZeroBot-Plugin 脚本机器人（塔罗/运势/签到/表情包等 / 指令）挂到本账号：随 QQ Agent 拉起并看护它的进程与 meme-generator 表情服务，共用同一个 OneBot 协议端；AI 聊天统一由 QQ Agent 负责，并拦截模型抢发脚本指令。插件页实时显示进程状态（掉线会给出原因），并注册状态查询工具（可直接问我\"脚本机器人在线吗\"）。",
+  "description": "把 ZeroBot-Plugin 脚本机器人（塔罗/运势/签到/表情包等 / 指令）挂到本账号：随 QQ Agent 拉起并看护它的进程与 meme-generator 表情服务，共用同一个 OneBot 协议端；可为它注入本地代理（修图片资源被墙）与 OpenAI 兼容 AI 接口（塔罗解析）；插件页实时显示进程状态，掉线给出原因，并注册状态查询工具。",
   "enabledByDefault": true,
   "settings": {
     "autoStart": true,
@@ -16,7 +16,12 @@
     "memeDir": "",
     "commandPrefixes": "/",
     "guardModelSends": true,
-    "restartBudget": 5
+    "restartBudget": 5,
+    "proxyUrl": "http://127.0.0.1:7897",
+    "aiApiUrl": "",
+    "aiApiKey": "",
+    "aiModel": "deepseek-flash",
+    "aiMaxTokens": 2048
   },
   "configSchema": {
     "autoStart": {
@@ -63,6 +68,32 @@
       "type": "number",
       "label": "崩溃自动重启上限",
       "description": "10 分钟窗口内最多自动重启次数，超过后停止看护并记录日志（0 = 不自动重启）。"
+    },
+    "proxyUrl": {
+      "type": "string",
+      "label": "子进程代理地址",
+      "description": "本地代理（Clash/Verge 等，如 http://127.0.0.1:7897）。签到背景与老婆/猪猪图库走境外站，直连被墙。启动时探测端口，代理没开则自动直连。留空关闭。"
+    },
+    "aiApiUrl": {
+      "type": "string",
+      "label": "塔罗 AI 解析接口",
+      "description": "OpenAI 兼容的完整接口地址（如 https://api.deepseek.com/chat/completions）。留空则塔罗只发牌面不解析（可以问鲸鲸Bot 解读）。"
+    },
+    "aiApiKey": {
+      "type": "string",
+      "secret": true,
+      "label": "塔罗 AI 接口 Key",
+      "description": "上面接口对应的 API Key。留空 = 不启用。"
+    },
+    "aiModel": {
+      "type": "string",
+      "label": "塔罗 AI 模型名",
+      "description": "接口使用的模型名，如 deepseek-flash。"
+    },
+    "aiMaxTokens": {
+      "type": "number",
+      "label": "塔罗 AI 输出上限",
+      "description": "单次解析的最大 token 数，默认 2048。"
     }
   },
   "prompt": {
