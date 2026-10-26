@@ -1,12 +1,12 @@
 {
   "id": "zerobot-runner",
   "name": "ZeroBot 脚本机器人挂载",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "apiVersion": 1,
   "category": "utility",
   "author": "QQ-agent merge",
-  "description": "把 ZeroBot-Plugin 脚本机器人（塔罗/运势/签到/表情包等 / 指令）挂到本账号：随 QQ Agent 拉起并看护它的进程与 meme-generator 表情服务，共用同一个 OneBot 协议端；AI 聊天统一由 QQ Agent 负责，并拦截模型抢发脚本指令。",
-  "enabledByDefault": false,
+  "description": "把 ZeroBot-Plugin 脚本机器人（塔罗/运势/签到/表情包等 / 指令）挂到本账号：随 QQ Agent 拉起并看护它的进程与 meme-generator 表情服务，共用同一个 OneBot 协议端；AI 聊天统一由 QQ Agent 负责，并拦截模型抢发脚本指令。插件页实时显示进程状态（掉线会给出原因），并注册状态查询工具（可直接问我\"脚本机器人在线吗\"）。",
+  "enabledByDefault": true,
   "settings": {
     "autoStart": true,
     "zbpDir": "",
@@ -71,7 +71,7 @@
         "id": "zerobot-coworker",
         "title": "同账号的脚本机器人",
         "priority": 60,
-        "content": "## 同账号还挂着一个脚本机器人\n\n这个 QQ 账号上，除了你，还有一个 ZeroBot 脚本机器人在同时工作（同一协议端、同一账号，同时在线是正常状态）：\n- 群里以 / 开头的指令（如 /塔罗、/运势、/签到、/服务列表，以及「表情 petpet」等）由它按固定脚本执行，通常立刻回复。这些不归你管，也不要复述或扮演它的执行结果。\n- 用户想要这些功能时，让他直接发对应指令即可（/服务列表 可查全部）。\n- 自然对话、查资料、看图、玩梗、记忆，都归你。"
+        "content": "## 同账号还挂着一个脚本机器人\n\n这个 QQ 账号上，除了你，还有一个 ZeroBot 脚本机器人在同时工作（同一协议端、同一账号，同时在线是正常状态）：\n- 群里以 / 开头的指令（如 /塔罗、/运势、/签到、/服务列表，以及「表情 petpet」等）由它按固定脚本执行，通常立刻回复。这些不归你管，也不要复述或扮演它的执行结果。\n- 用户想要这些功能时，让他直接发对应指令即可（/服务列表 可查全部）。\n- 自然对话、查资料、看图、玩梗、记忆，都归你。\n- 用户问\"脚本机器人/zbp 在不在、掉线了没、表情包还能用吗\"时，先用 zerobot-runner__status 工具查实际状态再回答，不要凭感觉猜。"
       }
     ]
   }

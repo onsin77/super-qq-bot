@@ -1,19 +1,32 @@
-// ZeroBot 脚本机器人挂载（确定性型插件）
+// ZeroBot 脚本机器人挂载（确定性型插件）v1.1
 //
 // 职责：让 ZeroBot-Plugin（Go 编写的指令型机器人：塔罗 / 运势 / 签到 / 表情包……）
 // 与 QQ Agent 共用同一个 OneBot 协议端、同一个 QQ 账号 ——
 //   1. 随本插件激活拉起 ZeroBot-Plugin.exe（-c config.json），崩溃自动看护重启；
 //   2. 一并拉起 meme-generator 表情服务（端口 2233，已在监听则复用）；
-//   3. before-tool 钩子拦截「模型自己发送脚本指令」，避免同一账号双执行。
+//   3. before-tool 钩子拦截「模型自己发送脚本指令」，避免同一账号双执行；
+//   4. available() 向插件页实时汇报 zbp 进程状态（红/绿 + 原因）；
+//   5. 注册 status 工具，用户可以直接问模型"脚本机器人在线吗"。
 //
-// 两个子进程都是独立的 WS 客户端，各自连协议端；QQ Agent 退出时它们一起被带走。
-// AI 聊天完全由 QQ Agent 负责 —— ZeroBot-Plugin 侧应已去掉大模型聊天插件。
+// v1.1 的三个行为修正（都来自实机排查）：
+//   · 子进程日志改走 cmd/sh 的 OS 级重定向（>> log 2>&1）——插件经管道捕获
+//     子进程输出在 Electron GUI 主进程里从未生效（数据事件一次都不触发，
+//     同款代码在纯 node / ELECTRON_RUN_AS_NODE 下均正常）；OS 重定向与
+//     JS 数据事件无关，任何环境都不可能静默失败。
+//   · 插件自身日志改走应用的 logger（api.log 只是 console.log，GUI 模式下
+//     无处可去，两天里一条都没落盘）。
+//   · 热重载不再杀子进程：杀毒/索引触碰插件目录会触发 fs.watch 误报 →
+//     全量重载，旧版每次都把 zbp 杀掉重拉（用户看到的"莫名其妙掉线"）。
+//     现在 deactivate(reason='reload') 保留子进程，新实例 activate 时直接
+//     接管（配置签名一致才接管；用户手动开关仍然完整启停）。
 
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { logger } from '../../src/logger.js';
+import { skillManager } from '../../src/skills/manager.js';
 
 const PLUGIN_DIR = path.dirname(fileURLToPath(import.meta.url));
 const APP_ROOT = path.resolve(PLUGIN_DIR, '..', '..');
@@ -25,25 +38,27 @@ const WATCH_INTERVAL_MS = Math.max(200, Number(process.env.ZEROBOT_RUNNER_WATCH_
 const RESTART_WINDOW_MS = 10 * 60_000;   // 崩溃重启的统计窗口
 const MEME_PORT = 2233;
 const CHILD_LOG_MAX_BYTES = 5 * 1024 * 1024;
+const LOG_TAG = 'zerobot-runner';
 
 let cfg = () => ({});
-let log = () => {};
-let warn = () => {};
+
+const log = (...a) => { try { logger.info(LOG_TAG, a.map(String).join(' ')); } catch { console.log(`[${LOG_TAG}]`, ...a); } };
+const warn = (...a) => { try { logger.warn(LOG_TAG, a.map(String).join(' ')); } catch { console.warn(`[${LOG_TAG}]`, ...a); } };
 
 // ── 跨热重载存活的运行状态 ─────────────────────────────────────────────
 // 热重载会用新的模块实例替换本文件，但子进程与「进程退出兜底」必须跨实例存活：
-// 挂到 globalThis 上，旧实例 deactivate 杀掉自己的子进程后，新实例接管状态对象。
+// 挂到 globalThis 上；旧实例 deactivate 杀掉自己的子进程后，新实例接管状态对象。
 const G = globalThis;
 if (!G.__zerobotRunner) {
   G.__zerobotRunner = {
-    zbp: null,        // { child, exe, dir, logStream }
-    meme: null,       // { child, dir, adopted }
+    zbp: null,        // { child, exe, dir, startedAt }
+    meme: null,       // { child, dir, py, adopted, startedAt }
     timer: null,
     gen: 0,           // 代数：deactivate 自增，在途的异步 reconcile 据此放弃拉起
     lastSig: '',
     restarts: [],     // 崩溃重启时间戳（预算窗口）
     gaveUp: false,
-    lastSpamLog: 0
+    lastExitZbp: null // { code, signal, at } 最近一次 zbp 退出记录（排查用）
   };
 }
 const S = G.__zerobotRunner;
@@ -84,6 +99,10 @@ function killByImage(exePath) {
 function isAlive(pid) {
   if (!pid || pid <= 0) return false;
   try { process.kill(pid, 0); return true; } catch (e) { return e?.code === 'EPERM'; }
+}
+
+function childAlive(entry) {
+  return Boolean(entry?.child?.pid && isAlive(entry.child.pid));
 }
 
 function probePort(port, host = '127.0.0.1', timeout = 1200) {
@@ -133,90 +152,87 @@ function resolveMeme(c) {
   return { dir, py };
 }
 
-/** 子进程输出 → 落盘 + 选摘转发（避免把整屏日志灌进应用日志）。 */
-function attachOutput(entry, name, childLogPath) {
+/**
+ * 拉起子进程并把输出交给 OS 级重定向写入日志文件。
+ *
+ * 为什么不自己接管道：插件在 Electron GUI 主进程里 spawn 的子进程，stdout/stderr
+ * 的 data 事件实测一次都不触发（同款选项在纯 node 与 ELECTRON_RUN_AS_NODE 下都
+ * 正常，应用自身拉 SnowLuma 也正常——原因未定位，但现象稳定复现）。改用
+ * cmd /d /s /c "exe" args >> "log" 2>&1：cmd 自己开文件句柄传给子进程，
+ * 不经过 JS 事件循环，不存在"静默丢日志"的路径。
+ * 返回的 child 是 cmd/sh 包装进程：pid 用于整树查杀，退出码透传（cmd /c 语义）。
+ */
+function spawnLogged(exe, args, cwd, logFile, extraEnv = {}) {
   try {
-    try {
-      if (fs.existsSync(childLogPath) && fs.statSync(childLogPath).size > CHILD_LOG_MAX_BYTES) {
-        fs.renameSync(childLogPath, `${childLogPath}.old`);
-      }
-    } catch { /* 滚动失败不影响启动 */ }
-    const stream = fs.createWriteStream(childLogPath, { flags: 'a' });
-    entry.logStream = stream;
-    let buf = '';
-    const consume = (chunk) => {
-      buf += String(chunk);
-      let idx;
-      while ((idx = buf.indexOf('\n')) >= 0) {
-        const line = buf.slice(0, idx).replace(/\r$/, '');
-        buf = buf.slice(idx + 1);
-        try { stream.write(line + '\n'); } catch { /* ignore */ }
-        // 只转发「值得看见」的行，且全局限频：协议端没开时子进程每 2 秒刷一条
-        // 重连警告，全量转发会把应用日志淹掉。
-        if (/error|panic|fatal|失败|错误|exited|连接.{0,12}(失败|错误)/i.test(line)) {
-          const now = Date.now();
-          if (now - S.lastSpamLog > 60_000) {
-            S.lastSpamLog = now;
-            warn(`[${name}] ${line.slice(0, 300)}`);
-          }
-        }
-      }
-    };
-    child.stdout?.on('data', consume);
-    child.stderr?.on('data', consume);
-  } catch { /* 日志挂接失败不影响运行 */ }
-}
-
-function detachOutput(entry) {
-  try { entry.logStream?.end(); } catch { /* ignore */ }
-  entry.logStream = null;
+    if (fs.existsSync(logFile) && fs.statSync(logFile).size > CHILD_LOG_MAX_BYTES) {
+      try { fs.renameSync(logFile, `${logFile}.old`); } catch { /* 滚动失败不影响启动 */ }
+    }
+  } catch { /* ignore */ }
+  const q = (s) => `"${String(s).replace(/"/g, '')}"`;
+  if (IS_WIN) {
+    // cross-spawn 同款技巧：整条命令再包一层外引号 + /s —— 没有外引号时 cmd 会把
+    // 命令行里第一对引号当定界符剥掉（实测报 'C:\Program' 不是内部或外部命令）。
+    const inner = [q(exe), ...args.map(q)].join(' ') + ` >> ${q(logFile)} 2>&1`;
+    return spawn('cmd.exe', ['/d', '/s', '/c', `"` + inner + `"`], {
+      cwd,
+      windowsHide: true,
+      // stdin 不是控制台时，zbp 的 abineundo 控制台插件会在 init 里 panic；
+      // DEBUG_MODE=1 是它自带的逃生阀（仅跳过控制台模式设置，无其他副作用）。
+      env: { ...process.env, DEBUG_MODE: '1', ...extraEnv },
+      stdio: ['ignore', 'ignore', 'ignore'],
+      windowsVerbatimArguments: true
+    });
+  }
+  const sq = (s) => "'" + String(s).replace(/'/g, "'\''") + "'";
+  const line = [sq(exe), ...args.map(sq)].join(' ') + ` >> ${sq(logFile)} 2>&1`;
+  return spawn('/bin/sh', ['-c', line], {
+    cwd,
+    env: { ...process.env, ...extraEnv },
+    stdio: ['ignore', 'ignore', 'ignore'],
+    detached: true
+  });
 }
 
 function spawnZbp(target) {
-  const child = spawn(target.exe, ['-c', path.join(target.dir, 'config.json')], {
-    cwd: target.dir,
-    windowsHide: true,
-    stdio: ['ignore', 'pipe', 'pipe'],
-    detached: !IS_WIN,
-    // stdin 不是控制台时，zbp 的 abineundo 控制台插件会在 init 里 panic；
-    // DEBUG_MODE=1 是它自带的逃生阀（仅跳过控制台模式设置，无其他副作用）。
-    env: { ...process.env, DEBUG_MODE: '1' }
-  });
-  const entry = { child, exe: target.exe, dir: target.dir, logStream: null };
-  attachOutput(entry, 'zerobot', path.join(DATA_DIR, 'zerobot-runner-zbp.log'));
+  const child = spawnLogged(
+    target.exe,
+    ['-c', path.join(target.dir, 'config.json')],
+    target.dir,
+    path.join(DATA_DIR, 'zerobot-runner-zbp.log')
+  );
+  const entry = { child, exe: target.exe, dir: target.dir, startedAt: Date.now() };
   child.on('error', (e) => warn(`ZeroBot-Plugin 拉起失败：${e.message}`));
   child.on('exit', (code, signal) => {
     if (S.zbp === entry) {
-      log(`ZeroBot-Plugin 已退出（code=${code} signal=${signal}），详细输出见 data/zerobot-runner-zbp.log`);
-      detachOutput(entry);
+      S.lastExitZbp = { code, signal, at: Date.now() };
+      log(`ZeroBot-Plugin 已退出（code=${code} signal=${signal}），完整输出见 data/zerobot-runner-zbp.log`);
+      reportHealth();
     }
   });
   S.zbp = entry;
   S.gaveUp = false;
-  log(`ZeroBot-Plugin 已拉起：${target.exe}（pid=${child.pid}）`);
+  log(`ZeroBot-Plugin 已拉起：${target.exe}（pid=${child.pid}），输出记录到 data/zerobot-runner-zbp.log`);
   return entry;
 }
 
 async function spawnMeme(target) {
   // 端口已被占用时直接复用现有服务（手动起的 / 上次没退干净都算），不重复启动。
   if (await probePort(MEME_PORT)) {
-    S.meme = { child: null, dir: target.dir, adopted: true };
+    S.meme = { child: null, dir: target.dir, py: target.py, adopted: true, startedAt: Date.now() };
     log(`meme-generator：端口 ${MEME_PORT} 已有服务在监听，直接复用`);
     return;
   }
-  const child = spawn(target.py, ['-m', 'meme_generator.app'], {
-    cwd: target.dir,
-    windowsHide: true,
-    stdio: ['ignore', 'pipe', 'pipe'],
-    detached: !IS_WIN
-  });
-  const entry = { child, dir: target.dir, py: target.py, logStream: null, adopted: false };
-  attachOutput(entry, 'meme', path.join(DATA_DIR, 'zerobot-runner-meme.log'));
+  const child = spawnLogged(
+    target.py,
+    ['-m', 'meme_generator.app'],
+    target.dir,
+    path.join(DATA_DIR, 'zerobot-runner-meme.log')
+  );
+  const entry = { child, dir: target.dir, py: target.py, adopted: false, startedAt: Date.now() };
   child.on('error', (e) => warn(`meme-generator 拉起失败：${e.message}`));
   child.on('exit', (code, signal) => {
     if (S.meme === entry) {
-      log(`meme-generator 已退出（code=${code} signal=${signal}），详细输出见 data/zerobot-runner-meme.log`);
-      detachOutput(entry);
+      log(`meme-generator 已退出（code=${code} signal=${signal}），完整输出见 data/zerobot-runner-meme.log`);
     }
   });
   S.meme = entry;
@@ -227,22 +243,20 @@ async function spawnMeme(target) {
 function stopZbp(reason) {
   const entry = S.zbp;
   if (!entry) return;
-  if (entry.child?.pid && isAlive(entry.child.pid)) {
+  if (childAlive(entry)) {
     log(`停止 ZeroBot-Plugin（${reason}）`);
     killTree(entry.child.pid);
   }
-  detachOutput(entry);
   S.zbp = null;
 }
 
 function stopMeme(reason) {
   const entry = S.meme;
   if (!entry) return;
-  if (entry.child?.pid && isAlive(entry.child.pid)) {
+  if (childAlive(entry)) {
     log(`停止 meme-generator（${reason}）`);
     killTree(entry.child.pid);
   }
-  detachOutput(entry);
   S.meme = null;
 }
 
@@ -293,7 +307,7 @@ async function reconcile(reason) {
   S.lastSig = sig;
 
   const zbpWanted = asBool(c.autoStart, true) && zbpTarget && !zbpTarget.error;
-  const zbpRunning = S.zbp?.child?.pid && isAlive(S.zbp.child.pid);
+  const zbpRunning = childAlive(S.zbp);
 
   if (!zbpWanted) {
     if (S.zbp) stopZbp(reason);
@@ -307,7 +321,7 @@ async function reconcile(reason) {
   }
 
   const memeWanted = asBool(c.memeEnabled, true) && zbpWanted && memeTarget && !memeTarget.error;
-  const memeRunning = S.meme?.child?.pid && isAlive(S.meme.child.pid);
+  const memeRunning = childAlive(S.meme);
 
   if (!memeWanted) {
     if (S.meme) stopMeme(reason);
@@ -327,6 +341,7 @@ async function reconcile(reason) {
       await spawnMeme(memeTarget);
     }
   }
+  reportHealth();
 }
 
 function startWatch() {
@@ -344,21 +359,140 @@ function stopWatch() {
   S.timer = null;
 }
 
+// ── 监测：状态快照（available() 与 status 工具共用）────────────────────
+
+function fmtUptime(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return '未知';
+  const m = Math.floor(ms / 60000);
+  if (m < 1) return `${Math.floor(ms / 1000)}秒`;
+  if (m < 60) return `${m}分钟`;
+  return `${Math.floor(m / 60)}小时${m % 60}分`;
+}
+
+/** 任务管理器里可见的 ZeroBot-Plugin 进程 pid 列表（看护句柄是 cmd 包装层，用户对不上号）。 */
+function listZbpProcesses() {
+  try {
+    const NL = String.fromCharCode(10);
+    if (IS_WIN) {
+      const out = (spawnSync('tasklist', ['/FI', 'IMAGENAME eq ZeroBot-Plugin.exe', '/FO', 'CSV', '/NH'],
+        { encoding: 'utf8', timeout: 5000 }).stdout || '');
+      return out.split(NL).map((l) => l.split(',')[1]).filter((x) => x && x !== '"PID"').map((x) => x.replace(/"/g, ''));
+    }
+    const out = (spawnSync('pgrep', ['-f', 'ZeroBot-Plugin'], { encoding: 'utf8', timeout: 5000 }).stdout || '');
+    return out.split(NL).flatMap((l) => l.split(String.fromCharCode(9))).map((x) => x.trim()).filter(Boolean);
+  } catch { return []; }
+}
+
+function buildStatus() {
+  const c = cfg();
+  const zbpTarget = resolveZbp(c);
+  const memeTarget = resolveMeme(c);
+  const running = childAlive(S.zbp);
+  const st = {
+    configured: Boolean(zbpTarget && !zbpTarget.error),
+    configError: zbpTarget?.error || memeTarget?.error || null,
+    running,
+    pid: running ? S.zbp.child.pid : null,
+    uptime: running ? fmtUptime(Date.now() - (S.zbp.startedAt || Date.now())) : null,
+    autoRestart: asBool(c.autoStart, true),
+    gaveUp: Boolean(S.gaveUp),
+    recentRestarts: S.restarts.length,
+    lastExit: null
+  };
+  if (S.lastExitZbp) {
+    st.lastExit = {
+      code: S.lastExitZbp.code,
+      signal: S.lastExitZbp.signal,
+      ago: fmtUptime(Date.now() - S.lastExitZbp.at)
+    };
+  }
+  return st;
+}
+
 // ── 插件生命周期 ───────────────────────────────────────────────────────
 
 export function setup(api) {
   cfg = api.config;
-  log = api.log;
-  warn = api.warn;
-  log('ZeroBot 脚本机器人挂载插件已加载（在设置里填好目录并启用后生效）');
+  // 状态查询工具：用户在 QQ 里问"zbp/脚本机器人/表情包服务 在吗、掉线了吗"时，
+  // 模型调它拿实时进程状态，不再靠猜。分类用 query（工具分类表里没有 utility）。
+  api.registerTool({
+    id: 'status',
+    name: '查询脚本机器人状态',
+    description: '查询同账号 ZeroBot 脚本机器人（处理 /塔罗、/签到、「表情 petpet」等指令的另一个进程）的实时状态：是否运行、pid、已运行时长、近期重启次数、meme 表情服务端口是否在监听。用户问"脚本机器人/zbp 在不在、掉线了没、表情包还能用吗"时先调这个工具，用真实状态回答。',
+    category: 'query',
+    parameters: { type: 'object', properties: {} },
+    async execute() {
+      const st = buildStatus();
+      let memeUp = null;
+      try { memeUp = await probePort(MEME_PORT); } catch { memeUp = null; }
+      const lines = [];
+      if (!st.configured) {
+        lines.push('脚本机器人：未配置（插件设置里没填 ZeroBot-Plugin 目录）');
+        if (st.configError) lines.push(`配置问题：${st.configError}`);
+      } else if (st.running) {
+        const pids = listZbpProcesses();
+        lines.push(`脚本机器人：运行中${pids.length ? `（任务管理器 pid ${pids.join('/')}，已运行 ${st.uptime}）` : `（已运行 ${st.uptime}）`}`);
+      } else if (st.gaveUp) {
+        lines.push('脚本机器人：未运行——近期反复退出，自动看护已暂停（在插件设置里保存一次，或开关一次插件可重试）');
+      } else {
+        lines.push('脚本机器人：未运行');
+      }
+      if (st.lastExit) lines.push(`上次退出：code=${st.lastExit.code}（${st.lastExit.ago}前）`);
+      if (st.recentRestarts > 0) lines.push(`近10分钟自动重启：${st.recentRestarts} 次`);
+      lines.push(`meme 表情服务（端口 ${MEME_PORT}）：${memeUp === true ? '正常' : memeUp === false ? '未监听（表情合成不可用）' : '未知'}`);
+      lines.push('详细日志：data/zerobot-runner-zbp.log');
+      return { content: lines.join('\n') };
+    }
+  });
+  log('ZeroBot 脚本机器人挂载插件已加载 v1.1（进程看护 + 状态查询工具）');
+}
+
+/**
+ * 插件本体永远可用（true）。
+ *
+ * ⚠️ 不要在这里回报 zbp 进程状态：available() 一旦 false，isActive 判定失效，
+ * 本插件注册的 before-tool 守卫和 status 工具会**一起停摆**——而用户恰恰在
+ * zbp 掉线时最需要问状态（"掉线了吗"），工具反而不可用就成了死循环。
+ * zbp 的健康状态走 reportHealth()（插件页「上次出错」徽章）+ status 工具。
+ */
+export function available() {
+  return true;
+}
+
+/**
+ * 把 zbp 的健康状态写到技能注册表的 errors 槽（插件页显示为「上次出错」红字）。
+ * 进程活着就清掉徽章；挂了/配置错就写明原因与修法。跨实例安全：包 try/catch。
+ */
+function reportHealth() {
+  try {
+    const c = cfg();
+    const zbpTarget = resolveZbp(c);
+    if (!zbpTarget) { skillManager.errors.delete('zerobot-runner'); return; }
+    if (zbpTarget.error) {
+      skillManager.errors.set('zerobot-runner', `配置有误：${zbpTarget.error}`);
+      return;
+    }
+    if (childAlive(S.zbp)) { skillManager.errors.delete('zerobot-runner'); return; }
+    const when = S.lastExitZbp ? `（上次退出 code=${S.lastExitZbp.code}，${fmtUptime(Date.now() - S.lastExitZbp.at)}前）` : '';
+    skillManager.errors.set('zerobot-runner', S.gaveUp
+      ? `ZeroBot-Plugin 反复退出已达上限，自动看护已暂停${when}——保存一次设置或开关一次插件即可重试；详见 data/zerobot-runner-zbp.log`
+      : `ZeroBot-Plugin 进程未运行${when}，看护器会自动补拉；持续未恢复见 data/zerobot-runner-zbp.log`);
+  } catch { /* 注册表不可用时静默降级（不影响进程看护本身） */ }
 }
 
 export function activate() {
   const c = cfg();
-  // 激活时清理同名残留：手动开着或上次崩溃没退干净的实例连同一个协议端会导致
-  // 每条消息被处理两遍，必须先清场再拉起（可用 killExisting 关闭该行为）。
   const zbpTarget = resolveZbp(c);
-  if (zbpTarget && !zbpTarget.error && asBool(c.killExisting, true)) {
+  const memeTarget = resolveMeme(c);
+  const sig = signatureOf(c, zbpTarget, memeTarget);
+  // 接管路径：热重载前留下的健康子进程 + 配置没变 → 直接接管，不打断机器人。
+  // （deactivate(reason='reload') 不杀子进程；这里必须跳过 killByImage，
+  //   否则刚保下来的进程会被自己按同名清场误杀。）
+  const adopting = childAlive(S.zbp) && zbpTarget && !zbpTarget.error && sig === S.lastSig;
+  if (adopting) {
+    log(`接管热重载前的子进程（ZeroBot-Plugin pid=${S.zbp.child.pid}，不重启）`);
+  } else if (zbpTarget && !zbpTarget.error && asBool(c.killExisting, true)) {
+    // 全新启动：清掉同名残留（手动开着或上次没退干净的实例连同一协议端会双回复）
     killByImage(zbpTarget.exe);
   }
   S.gaveUp = false;
@@ -369,6 +503,12 @@ export function activate() {
 export function deactivate({ reason } = {}) {
   S.gen += 1;
   stopWatch();
+  // 热重载（含 fs.watch 误报触发的全量重扫）：子进程保持运行，新实例 activate
+  // 会直接接管。真正要停的是用户开关、卸载、退出这几类。
+  if (reason === 'reload') {
+    log(`热重载：子进程保持运行（zbp pid=${S.zbp?.child?.pid ?? '-'}），由新实例接管`);
+    return;
+  }
   stopZbp(`deactivate${reason ? `:${reason}` : ''}`);
   stopMeme(`deactivate${reason ? `:${reason}` : ''}`);
 }
@@ -412,3 +552,7 @@ export const hooks = {
     }
   }
 };
+
+// 仅供测试使用：wrapper 与状态构造在测试里做真实行为验证。
+export const __test = { spawnLogged, buildStatus };
+export const __reportHealthForTest = reportHealth;
