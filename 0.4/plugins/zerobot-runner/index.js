@@ -194,6 +194,32 @@ function spawnLogged(exe, args, cwd, logFile, extraEnv = {}) {
 }
 
 /**
+ * 隧道级探测：经代理对 gstatic 发 CONNECT。只测端口会漏掉"端口在听、
+ * 上游节点已死"的状态（Clash 重启/订阅过期后的常态），那种情况下注入
+ * 代理反而会把本可直连的 deepseek/pic.re 一起拖死。
+ */
+function probeProxyTunnel(proxyUrl, timeout = 5000) {
+  return new Promise((resolve) => {
+    let u;
+    try { u = new URL(proxyUrl); } catch { return resolve(false); }
+    const CRLF = String.fromCharCode(13, 10);
+    const s = net.connect({ port: Number(u.port) || (u.protocol === 'https:' ? 443 : 80), host: u.hostname || '127.0.0.1' });
+    let buf = '';
+    const done = (v) => { try { s.destroy(); } catch { /* ignore */ } resolve(v); };
+    s.setTimeout(timeout, () => done(false));
+    s.once('connect', () => {
+      try { s.write('CONNECT www.gstatic.com:443 HTTP/1.1' + CRLF + 'Host: www.gstatic.com:443' + CRLF + CRLF); } catch { done(false); }
+    });
+    s.on('data', (d) => {
+      buf += String(d);
+      if (/HTTP\/1\.[01] 200/.test(buf)) done(true);
+      else if (/HTTP\/1\.[01] \d{3}/.test(buf)) done(false);
+    });
+    s.on('error', () => done(false));
+  });
+}
+
+/**
  * 解析代理设置并探测端口；不通则返回 null（回退直连——Clash 没开时
  * 代理变量只会坏事，直连至少保住 GitHub 源可达）。
  * 作用域仅 zbp 子进程：它要下载的签到背景（pic.re）与老婆/猪猪图库
@@ -204,11 +230,9 @@ async function resolveProxyEnv() {
   const raw = String(cfg().proxyUrl || '').trim();
   if (!raw) return null;
   try {
-    const u = new URL(raw);
-    const host = u.hostname || '127.0.0.1';
-    const port = Number(u.port) || (u.protocol === 'https:' ? 443 : 80);
-    if (!(await probePort(port, host, 1200))) {
-      warn(`代理 ${raw} 探测不通（代理软件没开？），本次直连`);
+    new URL(raw);
+    if (!(await probeProxyTunnel(raw))) {
+      warn(`代理 ${raw} 隧道探测不通（代理没开或节点失效），本次直连`);
       return null;
     }
     return {
